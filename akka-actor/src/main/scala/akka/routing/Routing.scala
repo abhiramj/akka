@@ -17,6 +17,7 @@ import scala.concurrent.forkjoin.ThreadLocalRandom
 import akka.dispatch.Dispatchers
 import scala.annotation.tailrec
 import concurrent.ExecutionContext
+import akka.event.Logging.Warning
 
 /**
  * A RoutedActorRef is an ActorRef that has a set of connected ActorRef and it uses a Router to
@@ -92,7 +93,10 @@ private[akka] class RoutedActorCell(_system: ActorSystemImpl, _ref: InternalActo
    * `RouterConfig.createRoute` and `Resizer.resize`
    */
   private[akka] def addRoutees(newRoutees: Iterable[ActorRef]): Unit = {
-    _routees = _routees ++ newRoutees
+    _routees ++= newRoutees
+    newRoutees foreach {
+      a ⇒ if (a.isTerminated) system.eventStream.publish(Warning(self.path.toString, getClass, "found dead routee " + a + " of type " + a.getClass))
+    }
     // subscribe to Terminated messages for all route destinations, to be handled by Router actor
     newRoutees foreach watch
   }
@@ -108,30 +112,27 @@ private[akka] class RoutedActorCell(_system: ActorSystemImpl, _ref: InternalActo
   }
 
   override def tell(message: Any, sender: ActorRef): Unit = {
-    resize()
-
+    resize() // Mucho importante
     val s = if (sender eq null) system.deadLetters else sender
-
-    val msg = message match {
-      case wrapped: RouterEnvelope ⇒ wrapped.message
-      case m                       ⇒ m
-    }
-
     applyRoute(s, message) match {
-      case Destination(_, x) :: Nil if x == self ⇒ super.tell(message, s)
-      case refs ⇒
-        refs foreach (p ⇒
-          if (p.recipient == self) super.tell(msg, p.sender)
-          else p.recipient.!(msg)(p.sender))
+      case Destination(_, x) :: Nil if x == self ⇒
+        super.tell(message, s)
+      case refs ⇒ refs foreach { p ⇒
+        val msg = message match {
+          case wrapped: RouterEnvelope ⇒ wrapped.message
+          case m                       ⇒ m
+        }
+        if (p.recipient == self) super.tell(msg, p.sender)
+        else p.recipient.!(msg)(p.sender)
+      }
     }
   }
 
-  def resize(): Unit = {
+  def resize(): Unit =
     for (r ← routerConfig.resizer) {
       if (r.isTimeForResize(resizeCounter.getAndIncrement()) && resizeInProgress.compareAndSet(false, true))
         super.tell(Router.Resize, self)
     }
-  }
 }
 
 /**
